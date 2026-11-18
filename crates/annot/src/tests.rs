@@ -5695,3 +5695,80 @@ endstream",
     assert!(list(&doc, 0)[0].contains(b"AAPL:AKExtras"));
     assert!(doc.repair_log().is_empty(), "{:?}", doc.repair_log());
 }
+
+#[test]
+fn pressure_ink_draws_filled_outlines_of_its_widths() {
+    let mut doc = fixture();
+    let strokes = vec![vec![[10.0, 10.0], [30.0, 10.0], [50.0, 10.0]]];
+    let widths = vec![vec![0.5, 1.0, 0.25]];
+    let i = add_pressure_ink(&mut doc, &new(0, Shape::Ink { strokes }), &widths, &meta("p")).unwrap();
+    let doc = reopen(&doc);
+    let d = &list(&doc, 0)[i];
+    // Still a standard drawing for every other viewer.
+    assert_eq!(d.name(b"Subtype"), Some(&b"Ink"[..]));
+    assert!(d.get(b"InkList").is_some());
+    let stored: Vec<f64> =
+        d.get(PRESSURE_WIDTHS_KEY).unwrap().as_array().unwrap()[0].as_array().unwrap().iter().map(|o| o.as_f64().unwrap()).collect();
+    assert_eq!(stored, vec![0.5, 1.0, 0.25]);
+    let ap = ap_content(&doc, d);
+    // Filled, not stroked: a disc of radius width × fraction / 2 at each point (/BS /W is 2).
+    assert!(ap.contains(" rg\n"), "{ap}");
+    assert!(ap.trim_end().ends_with('f'), "{ap}");
+    assert!(!ap.contains("\nS\n"), "{ap}");
+    assert!(ap.contains("10.5 10 m\n"), "the first point's disc has radius 0.5: {ap}");
+    assert!(ap.contains("31 10 m\n"), "the widest point's disc has radius 1: {ap}");
+    assert!(ap.contains("50.25 10 m\n"), "the last point's disc has radius 0.25: {ap}");
+}
+
+#[test]
+fn pressure_ink_rejects_widths_that_dont_match() {
+    let mut doc = fixture();
+    let ink = || new(0, Shape::Ink { strokes: vec![vec![[10.0, 10.0], [20.0, 20.0]]] });
+    assert!(add_pressure_ink(&mut doc, &ink(), &[vec![1.0]], &meta("a")).is_err());
+    assert!(add_pressure_ink(&mut doc, &ink(), &[vec![1.0, 1.0], vec![1.0]], &meta("b")).is_err());
+    assert!(add_pressure_ink(&mut doc, &ink(), &[vec![1.0, f64::NAN]], &meta("c")).is_err());
+    let note = new(0, Shape::Note { at: [10.0, 10.0], icon: NoteIcon::Comment });
+    assert!(add_pressure_ink(&mut doc, &note, &[vec![1.0]], &meta("d")).is_err());
+    // Out-of-range fractions are clamped, not refused.
+    let i = add_pressure_ink(&mut doc, &ink(), &[vec![0.0, 7.0]], &meta("e")).unwrap();
+    let d = &list(&doc, 0)[i];
+    let stored: Vec<f64> =
+        d.get(PRESSURE_WIDTHS_KEY).unwrap().as_array().unwrap()[0].as_array().unwrap().iter().map(|o| o.as_f64().unwrap()).collect();
+    assert_eq!(stored, vec![0.05, 1.0]);
+}
+
+#[test]
+fn erasing_pressure_ink_keeps_the_kept_points_widths() {
+    let mut doc = fixture();
+    let strokes = vec![vec![[0.0, 100.0], [100.0, 100.0]]];
+    let i = add_pressure_ink(&mut doc, &new(0, Shape::Ink { strokes }), &[vec![0.2, 1.0]], &meta("p")).unwrap();
+    // Erase the middle: two runs remain, each with widths along the original ramp.
+    assert!(erase_ink(&mut doc, 0, i, &[[50.0, 100.0]], 5.0, &meta("e")).unwrap());
+    let doc = reopen(&doc);
+    let d = &list(&doc, 0)[i];
+    let ink = d.get(b"InkList").unwrap().as_array().unwrap();
+    let widths = d.get(PRESSURE_WIDTHS_KEY).unwrap().as_array().unwrap();
+    assert_eq!(ink.len(), 2);
+    assert_eq!(widths.len(), 2);
+    for (s, w) in ink.iter().zip(widths) {
+        assert_eq!(s.as_array().unwrap().len(), w.as_array().unwrap().len() * 2);
+    }
+    let first: Vec<f64> = widths[0].as_array().unwrap().iter().map(|o| o.as_f64().unwrap()).collect();
+    let last: Vec<f64> = widths[1].as_array().unwrap().iter().map(|o| o.as_f64().unwrap()).collect();
+    assert!((first[0] - 0.2).abs() < 1e-9);
+    assert!((last[last.len() - 1] - 1.0).abs() < 1e-9);
+    assert!(first.windows(2).all(|w| w[1] >= w[0]), "widths rise along the stroke: {first:?}");
+    assert!(ap_content(&doc, d).trim_end().ends_with('f'), "still drawn with its widths");
+}
+
+#[test]
+fn mismatched_pressure_widths_fall_back_to_the_constant_width() {
+    let mut doc = fixture();
+    let i = add_pressure_ink(&mut doc, &new(0, Shape::Ink { strokes: vec![vec![[0.0, 0.0], [10.0, 10.0]]] }), &[vec![1.0, 1.0]], &meta("p")).unwrap();
+    // Another editor rewrites the strokes without knowing about the widths.
+    let (_, r) = annot_ref(&mut doc, 0, i).unwrap();
+    doc.update_dict(r, |d| d.set(b"InkList".to_vec(), Object::Array(vec![num_array(&[0.0, 0.0, 5.0, 5.0, 10.0, 0.0])]))).unwrap();
+    set_appearance(&mut doc, r).unwrap();
+    let ap = ap_content(&doc, &list(&doc, 0)[i]);
+    assert!(ap.contains("\nS\n"), "stroked at /BS /W: {ap}");
+}

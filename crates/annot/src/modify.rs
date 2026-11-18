@@ -1495,6 +1495,12 @@ pub fn erase_ink(doc: &mut Document, page: usize, index: usize, path: &[[f64; 2]
         return Err(AnnotError::Invalid("invalid eraser path".into()));
     }
     let strokes = ink_strokes(doc, &d)?;
+    // A drawing with a width per point keeps each kept point's width.
+    let fractions = d
+        .get(b"InkList")
+        .and_then(|l| doc.resolve(l).as_array().cloned())
+        .and_then(|list| crate::pressure::fractions(&d, &list))
+        .filter(|f| f.len() == strokes.len() && f.iter().zip(&strokes).all(|(f, s)| f.len() == s.len()));
     // Distance from a point to the eraser's path (segments, or a single point).
     let near = |p: [f64; 2]| -> bool {
         if path.len() == 1 {
@@ -1509,20 +1515,25 @@ pub fn erase_ink(doc: &mut Document, page: usize, index: usize, path: &[[f64; 2]
         })
     };
     let mut kept: Vec<Vec<[f64; 2]>> = Vec::new();
+    // The kept points' width fractions, parallel to `kept` (1 for a drawing without them).
+    let mut kept_widths: Vec<Vec<f64>> = Vec::new();
     let mut erased = false;
     let mut samples = 0usize;
-    for s in &strokes {
+    for (si, s) in strokes.iter().enumerate() {
+        let widths = fractions.as_ref().and_then(|f| f.get(si));
+        let width_at = |i: usize| widths.and_then(|w| w.get(i)).copied().unwrap_or(1.0);
         // Densify so long segments are cut where the eraser crosses them.
-        let mut pts: Vec<[f64; 2]> = Vec::new();
-        for w in s.windows(2) {
+        let mut pts: Vec<([f64; 2], f64)> = Vec::new();
+        for (i, w) in s.windows(2).enumerate() {
             let n = ((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]) / (radius / 2.0)).ceil().clamp(1.0, 2000.0) as usize;
             samples = samples.saturating_add(n);
             if samples > MAX_ERASE_SAMPLES {
                 return Err(AnnotError::Invalid("the drawing is too large to erase at this eraser size".into()));
             }
+            let (w0, w1) = (width_at(i), width_at(i + 1));
             for k in 0..n {
                 let t = k as f64 / n as f64;
-                pts.push([w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t]);
+                pts.push(([w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t], w0 + (w1 - w0) * t));
             }
         }
         if let Some(last) = s.last() {
@@ -1531,22 +1542,26 @@ pub fn erase_ink(doc: &mut Document, page: usize, index: usize, path: &[[f64; 2]
             if samples > MAX_ERASE_SAMPLES {
                 return Err(AnnotError::Invalid("the drawing is too large to erase at this eraser size".into()));
             }
-            pts.push(*last);
+            pts.push((*last, width_at(s.len().saturating_sub(1))));
         }
-        let mut run: Vec<[f64; 2]> = Vec::new();
-        for p in pts {
+        let mut run: Vec<([f64; 2], f64)> = Vec::new();
+        for (p, w) in pts {
             if near(p) {
                 erased = true;
                 if run.len() >= 2 {
-                    kept.push(std::mem::take(&mut run));
+                    let (points, widths) = std::mem::take(&mut run).into_iter().unzip();
+                    kept.push(points);
+                    kept_widths.push(widths);
                 }
                 run.clear();
             } else {
-                run.push(p);
+                run.push((p, w));
             }
         }
         if run.len() >= 2 {
-            kept.push(run);
+            let (points, widths) = run.into_iter().unzip();
+            kept.push(points);
+            kept_widths.push(widths);
         }
     }
     if !erased {
@@ -1566,6 +1581,9 @@ pub fn erase_ink(doc: &mut Document, page: usize, index: usize, path: &[[f64; 2]
     let rect = grow(bounds(kept.iter().flatten().copied()).unwrap_or_default(), width / 2.0 + 1.0);
     doc.update_dict(r, |d| {
         d.set(b"InkList".to_vec(), Object::Array(kept.iter().map(|s| num_array(&s.concat())).collect()));
+        if fractions.is_some() {
+            d.set(crate::pressure::WIDTHS_KEY.to_vec(), Object::Array(kept_widths.iter().map(|w| num_array(w)).collect()));
+        }
         d.set(b"Rect".to_vec(), num_array(&rect));
         touch(d, meta);
     })?;

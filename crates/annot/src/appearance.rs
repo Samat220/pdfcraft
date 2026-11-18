@@ -1222,6 +1222,18 @@ fn draw_ink(context: &AppearanceContext<'_>, drawing: &mut AppearanceDrawing) ->
     let c = &mut drawing.content;
     let col = stroke?;
     let list = d.get(b"InkList")?.as_array()?;
+    // Ink with a width per point (a pressure-sensitive pen) is filled outlines of those widths.
+    if let Some(fractions) = crate::pressure::fractions(d, list) {
+        c.push_str(&rg(col));
+        for (s, f) in list.iter().zip(fractions) {
+            let pts: Vec<f64> = s.as_array()?.iter().map(|o| o.as_f64()).collect::<Option<_>>()?;
+            let pts: Vec<(f64, f64)> = pts.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect();
+            let radii: Vec<f64> = f.iter().map(|f| f * w / 2.0).collect();
+            c.push_str(&crate::pressure::outline_path(&pts, &radii, n));
+        }
+        c.push_str("f\n");
+        return Some(());
+    }
     // `/BS` gives an ink stroke its width and dash pattern (Table 182).
     c.push_str(&format!("{}{} w 1 J 1 j\n{}", rg_stroke(col), n(w), dash(d)));
     for s in list {
